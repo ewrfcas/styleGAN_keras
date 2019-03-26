@@ -5,13 +5,19 @@ from keras.initializers import VarianceScaling, ones
 from model.keras_layers import SetLearningRate, StyleLayer, InstanceNorm, Blur2D, ResidualAdd, NoiseLayer, \
     TruncationLayer, StyleMixLayer, MinibatchStddevLayer, count_params
 import keras.backend as K
+from keras.utils import multi_gpu_model
+import tensorflow as tf
 import math
+from model.loss import build_loss
+import keras.backend.tensorflow_backend as KTF
+from keras.optimizers import Adam
 
 
 class StyleGAN:
     def __init__(self,
                  min_resolution=4,
                  max_resolution=1024,
+                 start_resolution=8,
                  latent_size=512,
                  label_size=0,
                  mapping_layers=8,
@@ -21,12 +27,15 @@ class StyleGAN:
                  dlatent_avg_beta=0.995,
                  style_mixing_prob=0.9,
                  mbstd_group_size=4,
-                 mbstd_num_features=1):
+                 mbstd_num_features=1,
+                 loss_type='logistic',
+                 gpu_num=0):
         # set model_num according to the resolution
         assert min_resolution <= max_resolution <= 1024
         assert 4 <= min_resolution <= max_resolution
         self.max_resolution = max_resolution
         self.min_resolution = min_resolution
+        self.start_resolution = start_resolution
         self.latent_size = latent_size
         self.label_size = label_size
         self.mapping_layers = mapping_layers
@@ -37,27 +46,61 @@ class StyleGAN:
         self.style_mixing_prob = style_mixing_prob
         self.mbstd_group_size = mbstd_group_size
         self.mbstd_num_features = mbstd_num_features
+        assert loss_type in {'wgan-gp', 'logistic'}
+        self.loss_type = loss_type
+        self.gpu_num = gpu_num
         self.model_num = int(math.log2(self.max_resolution // self.min_resolution)) + 1
         # resolution: channel
         self.channel_dict = {4: 512, 8: 512, 16: 512, 32: 512, 64: 256, 128: 128, 256: 64, 512: 32, 1024: 16}
+        self.lr_dict = {4: 0.001, 8: 0.001, 16: 0.001, 32: 0.001, 64: 0.001,
+                        128: 0.0015, 256: 0.002, 512: 0.003, 1024: 0.003}
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        sess = tf.Session(config=config)
+        KTF.set_session(sess)
 
         # init the shared Mapping Network in Generators
         self._G_mapping = self.G_mapping()
 
         self._G_encoders = {}
         self._G_models = {}
+        self._G_train_models = {}
+        self._G_train_models_mg = {}
+
         self._D_decoders = {}
         self._D_models = {}
+        self._D_train_models = {}
+        self._D_train_models_mg = {}
+
         print('building G models...')
         for i in range(self.model_num):
             res = int(self.min_resolution * math.pow(2, i))
-            self._G_encoders[res] = self.G_encoder(res)
-            self._G_models[res] = self.G_model(res)
-            print('Generator %dx%d output:' % (res, res), self._G_models[res].outputs[0].shape)
+            with tf.device('/cpu:0'):
+                self._G_encoders[res] = self.G_encoder(res)
+                self._G_models[res] = self.G_model(res)
+                print('Generator %dx%d output:' % (res, res), self._G_models[res].outputs[0].shape)
 
-            self._D_decoders[res] = self.D_decoder(res)
-            self._D_models[res] = self.D_model(res)
-            print('Discriminator %dx%d output:' % (res, res), self._D_models[res].outputs[0].shape)
+                self._D_decoders[res] = self.D_decoder(res)
+                self._D_models[res] = self.D_model(res)
+                print('Discriminator %dx%d output:' % (res, res), self._D_models[res].outputs[0].shape)
+
+                if res >= start_resolution:
+                    self._G_train_models[res], self._D_train_models[res] = \
+                        build_loss(self._G_models[res], self._D_models[res], res, self.latent_size, self.loss_type)
+
+            if res >= start_resolution:
+                if self.gpu_num > 1:
+                    self._G_train_models_mg[res] = multi_gpu_model(self._G_train_models[res], gpus=self.gpu_num)
+                    self._D_train_models_mg[res] = multi_gpu_model(self._D_train_models[res], gpus=self.gpu_num)
+                    self._G_train_models_mg[res].compile(optimizer=Adam(lr=self.lr_dict[res],
+                                                                        beta_1=0.0, beta_2=0.99, epsilon=1e-8))
+                    self._D_train_models_mg[res].compile(optimizer=Adam(lr=self.lr_dict[res],
+                                                                        beta_1=0.0, beta_2=0.99, epsilon=1e-8))
+                else:
+                    self._G_train_models[res].compile(optimizer=Adam(lr=self.lr_dict[res],
+                                                                     beta_1=0.0, beta_2=0.99, epsilon=1e-8))
+                    self._D_train_models[res].compile(optimizer=Adam(lr=self.lr_dict[res],
+                                                                     beta_1=0.0, beta_2=0.99, epsilon=1e-8))
 
         print('Generator trainable params:', count_params(self._G_models[self.max_resolution].trainable_weights))
         print('Discriminator trainable params:', count_params(self._D_models[self.max_resolution].trainable_weights))
@@ -83,8 +126,8 @@ class StyleGAN:
             x = RepeatVector(self.model_num * 2)(x)  # [batch, dim]->[batch, layer*2, dim]
 
             # truncation trick
-            x = TruncationLayer(self.model_num * 2, self.latent_size, self.truncation_psi,
-                                self.truncation_cutoff, self.dlatent_avg_beta)(x)
+            # x = TruncationLayer(self.model_num * 2, self.latent_size, self.truncation_psi,
+            #                     self.truncation_cutoff, self.dlatent_avg_beta)(x)
 
         return Model(inputs=inputs, outputs=x)
 
@@ -167,7 +210,7 @@ class StyleGAN:
             dlatents_in = Input(batch_shape=(None, self.latent_size), name=scope_name + '_latent')
             labels_in = Input(batch_shape=(None, self.label_size))
             const_scale = Input(batch_shape=(None, 1, 1, 1), name=scope_name + '_const')
-            res_in = Input(batch_shape=(1,), name='res_in')  # the training input res e.g.[4,8,16...]
+            res_in = Input(batch_shape=(None, 1), name='res_in')  # the training input res e.g.[4,8,16...]
 
             # get G_mapping [batch, layer, dim]
             dlatents_mapping = self._G_mapping(dlatents_in if self.label_size == 0 else [dlatents_in, labels_in])
@@ -192,6 +235,7 @@ class StyleGAN:
                 inputs = [dlatents_in, const_scale, res_in]
             else:
                 inputs = [dlatents_in, labels_in, const_scale, res_in]
+
             return Model(inputs=inputs, outputs=x, name=scope_name)
 
     def from_RGB(self, img_in, res):
@@ -209,7 +253,7 @@ class StyleGAN:
             input_feat = Input(batch_shape=(None, res, res, self.channel_dict[res]))
             labels_in = Input(batch_shape=(None, self.label_size))
             img_in = Input(batch_shape=(None, res, res, 3))  # the image
-            res_in = Input(batch_shape=(1,), name='res_in')  # the training input res
+            res_in = Input(batch_shape=(None, 1), name='res_in')  # the training input res
 
             # print(input_feat, img_in)
 
@@ -254,13 +298,9 @@ class StyleGAN:
         scope_name = '%dx%d_D_Model' % (res, res)
         with K.name_scope(scope_name):
             img_in = Input(batch_shape=(None, res, res, 3))
-            res_in = Input(batch_shape=(1,), name='res_in')  # the training input res
+            res_in = Input(batch_shape=(None, 1), name='res_in')  # the training input res
 
             x = self.from_RGB(img_in, res)
             x = self._D_decoders[res]([x, img_in, res_in])
 
             return Model(inputs=[img_in, res_in], outputs=x, name=scope_name)
-
-
-if __name__ == '__main__':
-    model = StyleGAN()

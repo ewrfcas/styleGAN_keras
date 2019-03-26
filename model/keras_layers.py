@@ -10,6 +10,7 @@ def keras_log2(x):
     denominator = K.log(K.constant(2, dtype=numerator.dtype))
     return numerator / denominator
 
+
 def count_params(weights):
     return int(np.sum([K.count_params(p) for p in set(weights)]))
 
@@ -74,8 +75,8 @@ class StyleLayer(Layer):
 
     def call(self, x, **kwargs):
         x, dlatent = x
-        style = K.dot(dlatent, self.style_weight) + self.bias
-        style = K.reshape(style, [-1, 2, x.shape[-1]])
+        style = tf.matmul(dlatent, self.style_weight) + self.bias
+        style = K.reshape(style, [-1, 2, 1, 1, x.shape[-1]])  # [N2HWC]
         return x * (style[:, 0] + 1) + style[:, 1]
 
 
@@ -129,6 +130,7 @@ class ResidualAdd(Layer):
     def call(self, inputs, **kwargs):
         assert len(inputs) == 3
         x1, x2, res_in = inputs
+        res_in = K.mean(res_in)
         ratio = K.clip(keras_log2(res_in) - keras_log2(K.cast(K.shape(x1)[1], float)), 0.0, 1.0)
         return x1 * ratio + x2 * (1 - ratio)
 
@@ -188,6 +190,7 @@ class StyleMixLayer(Layer):
         else:
             dlatents, res_in = inputs
         # dlatents: [batch, layers, dim]
+        res_in = K.mean(res_in)
         with K.name_scope('StyleMix'):
             dlatents2 = tf.random_normal(tf.shape(dlatents[:, 0, :]))
             if labels_in is not None:
@@ -195,7 +198,7 @@ class StyleMixLayer(Layer):
             else:
                 dlatents2 = self.G_mapping(dlatents2)
             layer_idx = np.arange(self.num_layers)[np.newaxis, :, np.newaxis]
-            cur_layers = tf.cast(keras_log2(res_in[0]), tf.int32) * 2 - 2
+            cur_layers = tf.cast(keras_log2(res_in), tf.int32) * 2 - 2
             mixing_cutoff = tf.cond(
                 tf.random_uniform([], 0.0, 1.0) < self.style_mixing_prob,
                 lambda: tf.random_uniform([], 1, cur_layers, dtype=tf.int32),
